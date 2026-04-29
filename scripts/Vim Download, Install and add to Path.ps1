@@ -455,4 +455,4 @@ function Clear-TemporaryVimCache {
 # Auto-run
 # ---------------------------------------------------------------------------
 
-Enable-TemporaryVim
+Enable-TemporaryVim -NoCache
