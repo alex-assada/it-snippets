@@ -1,0 +1,2 @@
+Get-Tpm
+Confirm-SecureBootUEFI
