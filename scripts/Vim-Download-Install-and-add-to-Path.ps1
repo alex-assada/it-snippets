@@ -593,15 +593,15 @@ function Read-TemporaryEditorChoice {
 
     Write-Host ""
     Write-Host "Which editor do you want to load?"
-    Write-Host "  [V] Vim     (default)"
-    Write-Host "  [N] Neovim"
+    Write-Host "  [V] Vim"
+    Write-Host "  [N] Neovim	(default)"
     Write-Host ""
 
     while ($true) {
         $answer = Read-Host "Choice (V/N)"
 
         if ([string]::IsNullOrWhiteSpace($answer)) {
-            return 'vim'
+            return 'neovim'
         }
 
         $a = $answer.Trim().ToLowerInvariant()
