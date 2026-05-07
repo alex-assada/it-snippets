@@ -1,62 +1,124 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-    Temporarily loads Vim into the current PowerShell session.
+    Temporarily loads Vim or Neovim into the current PowerShell session.
 
 .DESCRIPTION
-    Downloads Vim, extracts it into a user-local cache, prepends Vim to the
-    current process PATH, and leaves the current machine/user PATH untouched.
+    Downloads the chosen editor, extracts it into a user-local cache, prepends
+    its bin directory to the current process PATH, and leaves the machine/user
+    PATH untouched.
 
     Extraction uses tar.exe first because Expand-Archive is slow as hell.
     If tar.exe is unavailable or fails, it falls back to Expand-Archive.
 
     Designed to work with:
 
-        iwr 'https://example/Enable-TemporaryVim.ps1' | iex
+        iwr 'https://example/Enable-TemporaryEditor.ps1' | iex
 
-    This is intentional because PATH must be modified in the caller's current
-    PowerShell process.
+    PATH must be modified in the caller's current PowerShell process, hence
+    the dot-source-style auto-run at the bottom.
 
 .NOTES
     Persistence:
-        - Vim files are cached under LOCALAPPDATA.
+        - Files are cached under LOCALAPPDATA per tool.
         - PATH change is current PowerShell process only.
         - No registry writes.
         - No permanent user/machine PATH modification.
 
     Functions exposed:
-        Enable-TemporaryVim
-        Disable-TemporaryVim
-        Get-TemporaryVim
-        Clear-TemporaryVimCache
+        Enable-TemporaryEditor   -Tool vim|neovim
+        Disable-TemporaryEditor  [-Tool vim|neovim|all]
+        Get-TemporaryEditor      [-Tool vim|neovim]
+        Clear-TemporaryEditorCache [-Tool vim|neovim|all]
+
+    Non-interactive selection (skips the prompt):
+        $env:TEMP_EDITOR_TOOL = 'neovim'; iwr '...' | iex
+        $global:TempEditorTool = 'vim';  iwr '...' | iex
 #>
 
 Set-StrictMode -Version Latest
 
 # ---------------------------------------------------------------------------
-# Script state
+# Editor profiles
 # ---------------------------------------------------------------------------
 
-if (-not (Get-Variable -Name TemporaryVimState -Scope Script -ErrorAction SilentlyContinue)) {
-    $script:TemporaryVimState = $null
+# Notes on default URLs:
+#   Vim:    pinned to a vim-win32-installer GitHub release. Bump as needed.
+#           vim.org URLs like gvim_9.X.0000_x64.zip are unreliable.
+#   Neovim: 'stable' tag auto-tracks the current stable release. Predictable
+#           filename, unpredictable SHA across time. Pin a version (e.g.
+#           v0.12.2) instead if you need reproducibility.
+
+$script:EditorProfiles = @{
+    'vim' = [pscustomobject]@{
+        Key            = 'vim'
+        DisplayName    = 'Vim'
+        DefaultZipUrl  = 'https://github.com/vim/vim-win32-installer/releases/download/v9.1.0825/gvim_9.1.0825_x64.zip'
+        ExeName        = 'vim.exe'
+        # Inside the zip: vim/vim91/vim.exe (or vim92/, etc.)
+        BinPathPattern = '\\vim\\vim\d+\\vim\.exe$'
+    }
+    'neovim' = [pscustomobject]@{
+        Key            = 'neovim'
+        DisplayName    = 'Neovim'
+        DefaultZipUrl  = 'https://github.com/neovim/neovim/releases/download/stable/nvim-win64.zip'
+        ExeName        = 'nvim.exe'
+        # Inside the zip: nvim-win64/bin/nvim.exe
+        BinPathPattern = '\\nvim-win64\\bin\\nvim\.exe$'
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Script state (per-tool hashtable so vim and neovim can coexist)
+# ---------------------------------------------------------------------------
+
+if (-not (Get-Variable -Name TemporaryEditorState -Scope Script -ErrorAction SilentlyContinue)) {
+    $script:TemporaryEditorState = @{}
 }
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-function Get-TemporaryVimDefaultCacheRoot {
+function Resolve-TemporaryEditorProfile {
     [CmdletBinding()]
-    param()
+    param(
+        [Parameter(Mandatory)]
+        [string] $Tool
+    )
 
-    if ($env:LOCALAPPDATA) {
-        return (Join-Path -Path $env:LOCALAPPDATA -ChildPath 'TempToolCache\vim')
+    $key = $Tool.Trim().ToLowerInvariant()
+
+    switch ($key) {
+        'nvim'   { $key = 'neovim' }
+        'gvim'   { $key = 'vim' }
+        'v'      { $key = 'vim' }
+        'n'      { $key = 'neovim' }
     }
 
-    return (Join-Path -Path $env:TEMP -ChildPath 'TempToolCache\vim')
+    if (-not $script:EditorProfiles.ContainsKey($key)) {
+        $valid = ($script:EditorProfiles.Keys | Sort-Object) -join ', '
+        throw "Unknown editor '$Tool'. Valid: $valid"
+    }
+
+    return $script:EditorProfiles[$key]
 }
 
-function Get-TemporaryVimCacheKey {
+function Get-TemporaryEditorDefaultCacheRoot {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $ToolKey
+    )
+
+    if ($env:LOCALAPPDATA) {
+        return (Join-Path -Path $env:LOCALAPPDATA -ChildPath "TempToolCache\$ToolKey")
+    }
+
+    return (Join-Path -Path $env:TEMP -ChildPath "TempToolCache\$ToolKey")
+}
+
+function Get-TemporaryEditorCacheKey {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
@@ -66,26 +128,29 @@ function Get-TemporaryVimCacheKey {
     $fileName = [System.IO.Path]::GetFileName(([uri] $ZipUrl).AbsolutePath)
 
     if (-not $fileName) {
-        return 'vim-cache'
+        return 'editor-cache'
     }
 
     return ($fileName -replace '\.zip$', '')
 }
 
-function Find-TemporaryVimExe {
+function Find-TemporaryEditorExe {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [string] $Root
+        [string] $Root,
+
+        [Parameter(Mandatory)]
+        [pscustomobject] $EditorProfile
     )
 
     if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
         return $null
     }
 
-    $preferred = Get-ChildItem -LiteralPath $Root -Recurse -File -Filter 'vim.exe' -ErrorAction SilentlyContinue |
+    $preferred = Get-ChildItem -LiteralPath $Root -Recurse -File -Filter $EditorProfile.ExeName -ErrorAction SilentlyContinue |
         Where-Object {
-            $_.FullName -match '\\vim\\vim\d+\\vim\.exe$'
+            $_.FullName -match $EditorProfile.BinPathPattern
         } |
         Select-Object -First 1
 
@@ -93,11 +158,11 @@ function Find-TemporaryVimExe {
         return $preferred
     }
 
-    return Get-ChildItem -LiteralPath $Root -Recurse -File -Filter 'vim.exe' -ErrorAction SilentlyContinue |
+    return Get-ChildItem -LiteralPath $Root -Recurse -File -Filter $EditorProfile.ExeName -ErrorAction SilentlyContinue |
         Select-Object -First 1
 }
 
-function Expand-TemporaryVimArchive {
+function Expand-TemporaryEditorArchive {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
@@ -110,7 +175,7 @@ function Expand-TemporaryVimArchive {
     $tar = Get-Command -Name 'tar.exe' -ErrorAction SilentlyContinue
 
     if ($tar) {
-        Write-Host "Extracting Vim with tar.exe..."
+        Write-Host "Extracting with tar.exe..."
 
         & $tar.Source -xf $ZipPath -C $DestinationPath
 
@@ -124,7 +189,7 @@ function Expand-TemporaryVimArchive {
         Write-Host "tar.exe not found. Falling back to Expand-Archive..."
     }
 
-    Write-Host "Extracting Vim with Expand-Archive..."
+    Write-Host "Extracting with Expand-Archive..."
 
     Expand-Archive `
         -LiteralPath $ZipPath `
@@ -132,30 +197,30 @@ function Expand-TemporaryVimArchive {
         -Force
 }
 
-function Add-TemporaryVimToPath {
+function Add-TemporaryEditorToPath {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [string] $VimDirectory
+        [string] $BinDirectory
     )
 
     $pathParts = $env:PATH -split ';' | Where-Object { $_ }
 
-    if ($pathParts -notcontains $VimDirectory) {
-        $env:PATH = @($VimDirectory) + $pathParts -join ';'
+    if ($pathParts -notcontains $BinDirectory) {
+        $env:PATH = (@($BinDirectory) + $pathParts) -join ';'
     }
 }
 
-function Remove-TemporaryVimFromPath {
+function Remove-TemporaryEditorFromPath {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [string] $VimDirectory
+        [string] $BinDirectory
     )
 
     $env:PATH = (($env:PATH -split ';') |
         Where-Object {
-            $_ -and ($_ -ne $VimDirectory)
+            $_ -and ($_ -ne $BinDirectory)
         }) -join ';'
 }
 
@@ -163,35 +228,33 @@ function Remove-TemporaryVimFromPath {
 # Main function
 # ---------------------------------------------------------------------------
 
-function Enable-TemporaryVim {
+function Enable-TemporaryEditor {
     [CmdletBinding()]
     param(
-        [Parameter()]
-        [ValidateNotNullOrEmpty()]
-        [string]
-        $ZipUrl = 'https://www.vim.org/downloads/gvim_9.2.0000_x64.zip',
+        [Parameter(Mandatory, Position = 0)]
+        [ValidateSet('vim', 'neovim', 'nvim', 'gvim', 'v', 'n')]
+        [string] $Tool,
 
         [Parameter()]
         [ValidateNotNullOrEmpty()]
-        [string]
-        $CacheRoot = (Get-TemporaryVimDefaultCacheRoot),
+        [string] $ZipUrl,
+
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
+        [string] $CacheRoot,
 
         [Parameter()]
         [ValidatePattern('^[a-fA-F0-9]{64}$')]
-        [string]
-        $ExpectedSha256,
+        [string] $ExpectedSha256,
 
         [Parameter()]
-        [switch]
-        $Force,
+        [switch] $Force,
 
         [Parameter()]
-        [switch]
-        $NoCache,
+        [switch] $NoCache,
 
         [Parameter()]
-        [switch]
-        $PassThru
+        [switch] $PassThru
     )
 
     $ErrorActionPreference = 'Stop'
@@ -199,37 +262,49 @@ function Enable-TemporaryVim {
     $oldProgressPreference = $ProgressPreference
     $ProgressPreference = 'SilentlyContinue'
 
-    $cacheKey = Get-TemporaryVimCacheKey -ZipUrl $ZipUrl
+    $editorProfile = Resolve-TemporaryEditorProfile -Tool $Tool
+
+    if (-not $ZipUrl) {
+        $ZipUrl = $editorProfile.DefaultZipUrl
+    }
+
+    if (-not $CacheRoot) {
+        $CacheRoot = Get-TemporaryEditorDefaultCacheRoot -ToolKey $editorProfile.Key
+    }
+
+    $cacheKey = Get-TemporaryEditorCacheKey -ZipUrl $ZipUrl
 
     if ($NoCache) {
-        $installRoot = Join-Path -Path $env:TEMP -ChildPath "temporary-vim-$PID"
+        $installRoot = Join-Path -Path $env:TEMP -ChildPath "temp-editor-$($editorProfile.Key)-$PID"
     }
     else {
         $installRoot = Join-Path -Path $CacheRoot -ChildPath $cacheKey
     }
 
-    $downloadRoot = Join-Path -Path $env:TEMP -ChildPath "temporary-vim-download-$PID"
-    $zipPath      = Join-Path -Path $downloadRoot -ChildPath 'vim.zip'
+    $downloadRoot = Join-Path -Path $env:TEMP -ChildPath "temp-editor-download-$($editorProfile.Key)-$PID"
+    $zipPath      = Join-Path -Path $downloadRoot -ChildPath 'editor.zip'
 
     try {
         # -------------------------------------------------------------------
         # Already loaded in this session
         # -------------------------------------------------------------------
 
+        $existing = $null
+        if ($script:TemporaryEditorState.ContainsKey($editorProfile.Key)) {
+            $existing = $script:TemporaryEditorState[$editorProfile.Key]
+        }
+
         if (
             -not $Force -and
-            $null -ne $script:TemporaryVimState -and
-            (Test-Path -LiteralPath $script:TemporaryVimState.VimExe -PathType Leaf)
+            $null -ne $existing -and
+            (Test-Path -LiteralPath $existing.ExePath -PathType Leaf)
         ) {
-            Add-TemporaryVimToPath -VimDirectory $script:TemporaryVimState.VimDirectory
+            Add-TemporaryEditorToPath -BinDirectory $existing.BinDirectory
 
-            Write-Host "Temporary Vim already loaded for this PowerShell session."
-            Write-Host "vim.exe: $($script:TemporaryVimState.VimExe)"
+            Write-Host "$($editorProfile.DisplayName) already loaded for this session."
+            Write-Host "Path: $($existing.ExePath)"
 
-            if ($PassThru) {
-                return $script:TemporaryVimState
-            }
-
+            if ($PassThru) { return $existing }
             return
         }
 
@@ -238,35 +313,33 @@ function Enable-TemporaryVim {
         # -------------------------------------------------------------------
 
         if (-not $Force) {
-            $cachedVimExe = Find-TemporaryVimExe -Root $installRoot
+            $cachedExe = Find-TemporaryEditorExe -Root $installRoot -EditorProfile $editorProfile
 
-            if ($cachedVimExe) {
-                $vimDirectory = $cachedVimExe.Directory.FullName
+            if ($cachedExe) {
+                $binDirectory = $cachedExe.Directory.FullName
+                Add-TemporaryEditorToPath -BinDirectory $binDirectory
 
-                Add-TemporaryVimToPath -VimDirectory $vimDirectory
-
-                $script:TemporaryVimState = [pscustomobject]@{
-                    Name         = 'Temporary Vim'
-                    VimExe       = $cachedVimExe.FullName
-                    VimDirectory = $vimDirectory
+                $state = [pscustomobject]@{
+                    Tool         = $editorProfile.Key
+                    DisplayName  = $editorProfile.DisplayName
+                    ExePath      = $cachedExe.FullName
+                    BinDirectory = $binDirectory
                     InstallRoot  = $installRoot
                     ZipUrl       = $ZipUrl
                     CacheEnabled = (-not $NoCache)
                     LoadedAt     = Get-Date
                     ProcessId    = $PID
                 }
+                $script:TemporaryEditorState[$editorProfile.Key] = $state
 
-                Write-Host "Temporary Vim loaded from cache for this PowerShell session only."
-                Write-Host "vim.exe: $($cachedVimExe.FullName)"
+                Write-Host "$($editorProfile.DisplayName) loaded from cache for this session."
+                Write-Host "Path: $($cachedExe.FullName)"
                 Write-Host ""
                 Write-Host "Try:"
-                Write-Host "  vim"
+                Write-Host "  $($editorProfile.ExeName -replace '\.exe$','')"
                 Write-Host ""
 
-                if ($PassThru) {
-                    return $script:TemporaryVimState
-                }
-
+                if ($PassThru) { return $state }
                 return
             }
         }
@@ -286,7 +359,7 @@ function Enable-TemporaryVim {
         New-Item -ItemType Directory -Path $installRoot -Force | Out-Null
         New-Item -ItemType Directory -Path $downloadRoot -Force | Out-Null
 
-        Write-Host "Downloading Vim..."
+        Write-Host "Downloading $($editorProfile.DisplayName)..."
         Write-Host "Source: $ZipUrl"
 
         Invoke-WebRequest `
@@ -309,32 +382,33 @@ function Enable-TemporaryVim {
             }
         }
 
-        Expand-TemporaryVimArchive `
+        Expand-TemporaryEditorArchive `
             -ZipPath $zipPath `
             -DestinationPath $installRoot
 
         Remove-Item -LiteralPath $downloadRoot -Recurse -Force -ErrorAction SilentlyContinue
 
-        $vimExe = Find-TemporaryVimExe -Root $installRoot
+        $exe = Find-TemporaryEditorExe -Root $installRoot -EditorProfile $editorProfile
 
-        if (-not $vimExe) {
-            throw "vim.exe not found after extraction."
+        if (-not $exe) {
+            throw "$($editorProfile.ExeName) not found after extraction under $installRoot."
         }
 
-        $vimDirectory = $vimExe.Directory.FullName
+        $binDirectory = $exe.Directory.FullName
+        Add-TemporaryEditorToPath -BinDirectory $binDirectory
 
-        Add-TemporaryVimToPath -VimDirectory $vimDirectory
-
-        $script:TemporaryVimState = [pscustomobject]@{
-            Name         = 'Temporary Vim'
-            VimExe       = $vimExe.FullName
-            VimDirectory = $vimDirectory
+        $state = [pscustomobject]@{
+            Tool         = $editorProfile.Key
+            DisplayName  = $editorProfile.DisplayName
+            ExePath      = $exe.FullName
+            BinDirectory = $binDirectory
             InstallRoot  = $installRoot
             ZipUrl       = $ZipUrl
             CacheEnabled = (-not $NoCache)
             LoadedAt     = Get-Date
             ProcessId    = $PID
         }
+        $script:TemporaryEditorState[$editorProfile.Key] = $state
 
         if ($NoCache) {
             Register-EngineEvent `
@@ -350,8 +424,8 @@ function Enable-TemporaryVim {
         }
 
         Write-Host ""
-        Write-Host "Temporary Vim loaded for this PowerShell session only."
-        Write-Host "vim.exe: $($vimExe.FullName)"
+        Write-Host "$($editorProfile.DisplayName) loaded for this session."
+        Write-Host "Path: $($exe.FullName)"
         Write-Host ""
 
         if (-not $NoCache) {
@@ -363,12 +437,10 @@ function Enable-TemporaryVim {
 
         Write-Host ""
         Write-Host "Try:"
-        Write-Host "  vim"
+        Write-Host "  $($editorProfile.ExeName -replace '\.exe$','')"
         Write-Host ""
 
-        if ($PassThru) {
-            return $script:TemporaryVimState
-        }
+        if ($PassThru) { return $state }
     }
     catch {
         Remove-Item -LiteralPath $downloadRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -385,74 +457,161 @@ function Enable-TemporaryVim {
 }
 
 # ---------------------------------------------------------------------------
-# Disable current-session Vim
+# Disable
 # ---------------------------------------------------------------------------
 
-function Disable-TemporaryVim {
+function Disable-TemporaryEditor {
     [CmdletBinding()]
     param(
+        [Parameter(Position = 0)]
+        [ValidateSet('vim', 'neovim', 'nvim', 'gvim', 'v', 'n', 'all')]
+        [string] $Tool = 'all',
+
         [switch] $PassThru
     )
 
-    if ($null -eq $script:TemporaryVimState) {
-        Write-Host "Temporary Vim is not loaded."
+    $keys = if ($Tool -eq 'all') {
+        @($script:TemporaryEditorState.Keys)
+    }
+    else {
+        @((Resolve-TemporaryEditorProfile -Tool $Tool).Key)
+    }
+
+    if (-not $keys -or $keys.Count -eq 0) {
+        Write-Host "No temporary editor loaded."
         return
     }
 
-    $oldState = $script:TemporaryVimState
+    $removed = @()
 
-    Remove-TemporaryVimFromPath -VimDirectory $oldState.VimDirectory
+    foreach ($k in $keys) {
+        if (-not $script:TemporaryEditorState.ContainsKey($k)) {
+            continue
+        }
 
-    if (-not $oldState.CacheEnabled) {
-        Remove-Item -LiteralPath $oldState.InstallRoot -Recurse -Force -ErrorAction SilentlyContinue
+        $state = $script:TemporaryEditorState[$k]
+
+        Remove-TemporaryEditorFromPath -BinDirectory $state.BinDirectory
+
+        if (-not $state.CacheEnabled) {
+            Remove-Item -LiteralPath $state.InstallRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
+        $script:TemporaryEditorState.Remove($k)
+
+        Write-Host "$($state.DisplayName) removed from this session."
+        $removed += $state
     }
 
-    $script:TemporaryVimState = $null
-
-    Write-Host "Temporary Vim removed from this PowerShell session."
-
-    if ($PassThru) {
-        return $oldState
-    }
+    if ($PassThru) { return $removed }
 }
 
 # ---------------------------------------------------------------------------
 # Inspect state
 # ---------------------------------------------------------------------------
 
-function Get-TemporaryVim {
+function Get-TemporaryEditor {
     [CmdletBinding()]
-    param()
+    param(
+        [Parameter(Position = 0)]
+        [ValidateSet('vim', 'neovim', 'nvim', 'gvim', 'v', 'n')]
+        [string] $Tool
+    )
 
-    return $script:TemporaryVimState
+    if ($Tool) {
+        $key = (Resolve-TemporaryEditorProfile -Tool $Tool).Key
+
+        if ($script:TemporaryEditorState.ContainsKey($key)) {
+            return $script:TemporaryEditorState[$key]
+        }
+
+        return $null
+    }
+
+    return $script:TemporaryEditorState.Values
 }
 
 # ---------------------------------------------------------------------------
 # Clear cache
 # ---------------------------------------------------------------------------
 
-function Clear-TemporaryVimCache {
+function Clear-TemporaryEditorCache {
     [CmdletBinding(SupportsShouldProcess)]
     param(
+        [Parameter(Position = 0)]
+        [ValidateSet('vim', 'neovim', 'nvim', 'gvim', 'v', 'n', 'all')]
+        [string] $Tool = 'all',
+
         [Parameter()]
-        [ValidateNotNullOrEmpty()]
-        [string]
-        $CacheRoot = (Get-TemporaryVimDefaultCacheRoot)
+        [string] $CacheRoot
     )
 
-    if (-not (Test-Path -LiteralPath $CacheRoot)) {
-        Write-Host "Temporary Vim cache does not exist."
-        return
+    $keys = if ($Tool -eq 'all') {
+        @($script:EditorProfiles.Keys)
+    }
+    else {
+        @((Resolve-TemporaryEditorProfile -Tool $Tool).Key)
     }
 
-    if ($PSCmdlet.ShouldProcess($CacheRoot, 'Remove temporary Vim cache')) {
-        Remove-Item -LiteralPath $CacheRoot -Recurse -Force -ErrorAction SilentlyContinue
-        Write-Host "Temporary Vim cache removed: $CacheRoot"
+    foreach ($k in $keys) {
+        $root = if ($CacheRoot) {
+            $CacheRoot
+        }
+        else {
+            Get-TemporaryEditorDefaultCacheRoot -ToolKey $k
+        }
+
+        if (-not (Test-Path -LiteralPath $root)) {
+            Write-Host "$k cache does not exist."
+            continue
+        }
+
+        if ($PSCmdlet.ShouldProcess($root, "Remove $k cache")) {
+            Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Host "$k cache removed: $root"
+        }
     }
 }
 
 # ---------------------------------------------------------------------------
-# Auto-run
+# Auto-run with editor selection prompt
 # ---------------------------------------------------------------------------
 
-Enable-TemporaryVim -NoCache
+function Read-TemporaryEditorChoice {
+    [CmdletBinding()]
+    param()
+
+    # Non-interactive overrides
+    if ($env:TEMP_EDITOR_TOOL) {
+        return $env:TEMP_EDITOR_TOOL
+    }
+
+    $globalVar = Get-Variable -Name 'TempEditorTool' -Scope Global -ErrorAction SilentlyContinue
+    if ($globalVar -and $globalVar.Value) {
+        return [string] $globalVar.Value
+    }
+
+    Write-Host ""
+    Write-Host "Which editor do you want to load?"
+    Write-Host "  [V] Vim     (default)"
+    Write-Host "  [N] Neovim"
+    Write-Host ""
+
+    while ($true) {
+        $answer = Read-Host "Choice (V/N)"
+
+        if ([string]::IsNullOrWhiteSpace($answer)) {
+            return 'vim'
+        }
+
+        $a = $answer.Trim().ToLowerInvariant()
+
+        if ('v','vim','gvim'    -contains $a) { return 'vim' }
+        if ('n','nvim','neovim' -contains $a) { return 'neovim' }
+
+        Write-Host "Invalid choice. Type V or N (or press Enter for Vim)."
+    }
+}
+
+$choice = Read-TemporaryEditorChoice
+Enable-TemporaryEditor -Tool $choice
