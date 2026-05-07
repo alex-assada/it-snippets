@@ -35,16 +35,21 @@ foreach ($k in $rebootKeys) { if (Test-Path $k) { $pendingReboot = $true; break 
 $raw = (Get-ItemProperty -Path 'HKLM:\SYSTEM\Setup\MoSetup\Volatile' -Name SetupProgress -ErrorAction SilentlyContinue).SetupProgress
 $hex = if ($null -ne $raw) { $raw.ToString('X') } else { $null }
 
-# --- Log analysis (only when staging exists) ---
-$realErrors = $null
+# --- Fatal-only error filter for post-mortem analysis ---
+# 0xC190xxxx is the Windows Setup fatal code family (driver issues, hard blocks, compat failures).
+# Generic 0x800700xx codes are noise during active upgrade and not a reliable failure signal.
+$fatalPattern = "0xC190[0-9a-fA-F]{4}|0x800F092[23]|0x80070070"
+$fatalErrors  = $null
 if (Test-Path $errLog) {
-    $realErrors = Get-Content $errLog -Tail 200 -ErrorAction SilentlyContinue |
-                  Where-Object { $_ -match "0x0*[1-9a-fA-F]" }
+    $fatalErrors = Get-Content $errLog -Tail 300 -ErrorAction SilentlyContinue |
+                   Where-Object { $_ -match $fatalPattern }
 }
+
+# --- Explicit rollback markers (only authoritative phrases) ---
 $rollback = $null
 if (Test-Path $actLog) {
     $rollback = Get-Content $actLog -Tail 500 -ErrorAction SilentlyContinue |
-                Select-String "Setup encountered an error|Rollback initiated|operation failed.*rolling back"
+                Select-String "Rollback was successful|Started rollback|Rolling back the operation"
 }
 
 # --- Decision logic ---
@@ -61,16 +66,11 @@ elseif ($isW11) {
     $color  = "Green"
 }
 elseif ($p) {
+    # Active upgrade. Don't report errors here -- setuperr.log noise is expected during staging.
     $progress = if ($hex) { " -- Progress(hex): $hex" } else { "" }
-    if ($realErrors) {
-        $status = "IN_PROGRESS_WITH_ERRORS"
-        $msg    = "Upgrade running ($($p.ProcessName -join ', ')) but setuperr.log shows non-zero codes -- monitor closely.$progress"
-        $color  = "Yellow"
-    } else {
-        $status = "IN_PROGRESS"
-        $msg    = "Upgrade in progress: $($p.ProcessName -join ', ').$progress"
-        $color  = "Green"
-    }
+    $status = "IN_PROGRESS"
+    $msg    = "Upgrade in progress: $($p.ProcessName -join ', ').$progress Final verdict only after reboot."
+    $color  = "Green"
 }
 elseif ($pendingReboot -and $btExists) {
     $status = "PENDING_REBOOT"
@@ -87,9 +87,10 @@ elseif ($winOldRecent) {
     $msg    = "Still on Windows 10 (build $build), Windows.old created ${winOldAgeDays}d ago -- upgrade was attempted and reverted."
     $color  = "Red"
 }
-elseif ($realErrors) {
+elseif ($fatalErrors) {
+    $codes = ($fatalErrors | Select-String -Pattern $fatalPattern -AllMatches | ForEach-Object { $_.Matches.Value } | Select-Object -Unique) -join ', '
     $status = "FAILED"
-    $msg    = "Non-zero error codes in setuperr.log, no active process -- upgrade attempt failed."
+    $msg    = "Setup-fatal error codes in setuperr.log [$codes], no active process -- upgrade attempt failed."
     $color  = "Red"
 }
 elseif ($btExists) {
@@ -106,16 +107,16 @@ else {
 Write-Host "`n[$status] $msg`n" -ForegroundColor $color
 
 [PSCustomObject]@{
-    Status          = $status
-    Message         = $msg
-    OSCaption       = $caption
-    Build           = $build
-    IsWindows11     = $isW11
-    WindowsOldAge   = $winOldAgeDays
-    StagingExists   = $btExists
-    ProcessRunning  = if ($p) { $p.ProcessName -join ',' } else { $null }
-    PendingReboot   = $pendingReboot
-    ProgressHex     = $hex
-    HasRealErrors   = [bool]$realErrors
-    HasRollback     = [bool]$rollback
+    Status         = $status
+    Message        = $msg
+    OSCaption      = $caption
+    Build          = $build
+    IsWindows11    = $isW11
+    WindowsOldAge  = $winOldAgeDays
+    StagingExists  = $btExists
+    ProcessRunning = if ($p) { $p.ProcessName -join ',' } else { $null }
+    PendingReboot  = $pendingReboot
+    ProgressHex    = $hex
+    HasFatalErrors = [bool]$fatalErrors
+    HasRollback    = [bool]$rollback
 }
