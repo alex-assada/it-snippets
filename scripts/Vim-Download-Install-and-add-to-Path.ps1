@@ -615,3 +615,6 @@ function Read-TemporaryEditorChoice {
 
 $choice = Read-TemporaryEditorChoice
 Enable-TemporaryEditor -Tool $choice
+
+function vim  { & vim.exe  --cmd "inoremap jk <Esc>" --cmd "inoremap kj <Esc>" @args }
+function nvim { & nvim.exe --cmd "inoremap jk <Esc>" --cmd "inoremap kj <Esc>" @args }
