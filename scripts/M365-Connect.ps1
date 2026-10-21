@@ -8,13 +8,27 @@
     (PowerShell 5.1 vs 7, .NET Framework, dependencies, execution policy),
     and connects / installs / updates them from one menu.
 
+    The tool only connects and manages local modules. It never changes anything
+    in a tenant, and it only reads local session state (Get-MgContext etc).
+    The one network call besides the sign-ins is an anonymous lookup of a
+    tenant's public OpenID configuration, used to compare tenant names with
+    tenant IDs.
+
     Console only: powershell.exe, pwsh or Windows Terminal. Not the ISE.
     Sessions you open stay live in the console after you quit the menu (Q).
 
 .NOTES
-    Run:   .\M365Connect.ps1
+    Run:   .\M365-Connect.ps1
     PnP:   set $env:PNP_CLIENTID to prefill your Entra app ID.
+    Log:   connects / disconnects are appended to C:\Temp\M365-Connect.log
+           (time, user, service, target tenant, connected tenant, account, result).
+           No tokens or passwords are ever written.
 #>
+[CmdletBinding()]
+param(
+    [string]$StartService,   # internal: set by the N key so a fresh console connects one service on launch
+    [string]$StartTenant     # internal: target tenant handed to that fresh console
+)
 
 # ---------------------------------------------------------------- host checks
 if ($Host.Name -eq 'Windows PowerShell ISE Host') {
@@ -42,8 +56,15 @@ $script:G = @{
 # ---------------------------------------------------------------- session state
 $script:SelfPath    = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.MyCommand.Path }
 $script:Docs        = [Environment]::GetFolderPath('MyDocuments')
-$script:Tenant      = ''
+$script:Tenant      = if ($StartTenant) { $StartTenant.Trim() } else { '' }
 $script:GraphScopes = 'User.Read.All, Group.Read.All, Directory.Read.All'
+# read-only presets for the Graph / Entra scope prompt (nothing here can change a tenant)
+$script:GraphPresets = @(
+    @{ Name = 'Directory (users, groups, directory)';       Scopes = 'User.Read.All, Group.Read.All, Directory.Read.All' },
+    @{ Name = 'Intune (devices, configuration, apps)';      Scopes = 'DeviceManagementManagedDevices.Read.All, DeviceManagementConfiguration.Read.All, DeviceManagementApps.Read.All' },
+    @{ Name = 'Security and policy (CA, audit, security)';  Scopes = 'Policy.Read.All, AuditLog.Read.All, SecurityEvents.Read.All' },
+    @{ Name = 'Reports and organization';                   Scopes = 'Reports.Read.All, Organization.Read.All' }
+)
 $script:SpoUrl      = ''
 $script:PnpUrl      = ''
 $script:PnpClientId = $env:PNP_CLIENTID
@@ -62,11 +83,27 @@ $script:Top         = 0
 $script:LastW       = 0
 $script:LastH       = 0
 $script:Scrolled    = $false
+$script:VTop        = 0
+$script:Visible     = 0
+$script:KeyLines    = @()
+$script:Groups      = @()
+$script:TenantIds   = @{}
+$script:LastError   = ''
+$script:BatchOk     = 0
+$script:BatchFail   = 0
+$script:CleanResult = ''
+$script:LogPath     = 'C:\Temp\M365-Connect.log'
+$script:GuidRx      = '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$'
 
 # ---------------------------------------------------------------- service catalog
+# Group     : services in one group share a session / disconnect (EXO + IPPS, the Graph family)
+# Shared    : same Connect-MgGraph session - "connect all" connects only the first one
+# Family    : regex of installed module names that belong to the service (old-version cleanup)
+# Conflicts : modules that must not be loaded in the same console
 $script:Services = @(
     @{
-        Key = 'EXO'; Name = 'Exchange Online'
+        Key = 'EXO'; Name = 'Exchange Online'; Group = 'exo'
+        Family = '^ExchangeOnlineManagement$'
         Module = 'ExchangeOnlineManagement'; Install = 'ExchangeOnlineManagement'
         MinPS = '5.1'; WinPSOnly = $false; Deps = @()
         Notes = 'Connect-ExchangeOnline. Target tenant is passed as -DelegatedOrganization (GDAP / partner access).'
@@ -78,14 +115,13 @@ $script:Services = @(
         }
         Test = {
             Get-ConnectionInformation | Where-Object { $_.State -eq 'Connected' -and $_.ConnectionUri -notmatch 'compliance' } |
-                Select-Object -First 1 | ForEach-Object {
-                    if ($_.DelegatedOrganization) { "$($_.UserPrincipalName) > $($_.DelegatedOrganization)" } else { [string]$_.UserPrincipalName }
-                }
+                Select-Object -First 1 | ForEach-Object { ConvertTo-ExoSess $_ }
         }
         Disconnect = { Disconnect-ExchangeOnline -Confirm:$false }
     },
     @{
-        Key = 'IPPS'; Name = 'Security & Compliance'
+        Key = 'IPPS'; Name = 'Security & Compliance'; Group = 'exo'
+        Family = '^ExchangeOnlineManagement$'
         Module = 'ExchangeOnlineManagement'; Install = 'ExchangeOnlineManagement'
         MinPS = '5.1'; WinPSOnly = $false; Deps = @()
         Notes = 'Connect-IPPSSession (Purview / Security & Compliance). Same module as Exchange Online - disconnect drops both.'
@@ -97,44 +133,57 @@ $script:Services = @(
         }
         Test = {
             Get-ConnectionInformation | Where-Object { $_.State -eq 'Connected' -and $_.ConnectionUri -match 'compliance' } |
-                Select-Object -First 1 | ForEach-Object { [string]$_.UserPrincipalName }
+                Select-Object -First 1 | ForEach-Object { ConvertTo-ExoSess $_ }
         }
         Disconnect = { Disconnect-ExchangeOnline -Confirm:$false }
     },
     @{
-        Key = 'GRAPH'; Name = 'Microsoft Graph'
+        Key = 'GRAPH'; Name = 'Microsoft Graph'; Group = 'mg'; Shared = $true
+        Family = '^Microsoft\.Graph(\.|$)'; FamilyExclude = '^Microsoft\.Graph\.(Beta|Entra)(\.|$)'
         Module = 'Microsoft.Graph.Authentication'; Install = 'Microsoft.Graph'
         MinPS = '5.1'; WinPSOnly = $false; Deps = @()
-        Notes = 'Connect-MgGraph with delegated scopes. Install pulls the full Microsoft.Graph SDK (large, several minutes).'
+        Notes = 'Connect-MgGraph with delegated scopes. Pick a read-only preset or type scopes. Install pulls the full Microsoft.Graph SDK (large, several minutes).'
         Hint  = 'Consent prompt = scope not granted yet. AADSTS errors: check the Entra sign-in log for your account.'
-        Connect = {
-            $sc = Read-Default '  Scopes (comma-separated)' $script:GraphScopes
-            $script:GraphScopes = $sc
-            $p = @{ Scopes = @($sc -split '\s*,\s*' | Where-Object { $_ }); NoWelcome = $true }
-            if ($script:Tenant) { $p.TenantId = $script:Tenant }
-            Connect-MgGraph @p
-        }
-        Test = { $c = Get-MgContext; if ($c) { "$($c.Account)  [$(@($c.Scopes).Count) scopes]" } }
+        Connect = { Connect-GraphSession }
+        Test = { Get-GraphSess }
         Disconnect = { Disconnect-MgGraph | Out-Null }
     },
     @{
-        Key = 'ENTRA'; Name = 'Microsoft Entra'
+        Key = 'GRAPHB'; Name = 'Microsoft Graph (Beta)'; Group = 'mg'; Shared = $true
+        Family = '^Microsoft\.Graph\.Beta(\.|$)'
+        Module = 'Microsoft.Graph.Beta.Users'; Install = 'Microsoft.Graph.Beta'
+        MinPS = '5.1'; WinPSOnly = $false; Deps = @('Microsoft.Graph.Authentication')
+        Notes = 'Beta Graph SDK (Get-MgBeta* cmdlets). Uses the same Connect-MgGraph session as Microsoft Graph. Install pulls the full Microsoft.Graph.Beta SDK (large).'
+        Hint  = 'Consent prompt = scope not granted yet. AADSTS errors: check the Entra sign-in log for your account.'
+        Connect = { Connect-GraphSession }
+        Test = { Get-GraphSess }
+        Disconnect = { Disconnect-MgGraph | Out-Null }
+    },
+    @{
+        Key = 'ENTRA'; Name = 'Microsoft Entra'; Group = 'mg'; Shared = $true; Conflicts = @('Microsoft.Entra.Beta')
+        Family = '^Microsoft\.Entra(\.|$)'; FamilyExclude = '^Microsoft\.Entra\.Beta(\.|$)'
         Module = 'Microsoft.Entra'; Install = 'Microsoft.Entra'
         MinPS = '5.1'; WinPSOnly = $false; Deps = @('Microsoft.Graph.Authentication')
         Notes = 'Microsoft.Entra module (Graph-based replacement for AzureAD). Shares the Graph session.'
         Hint  = 'Consent prompt = scope not granted yet. Assembly errors: Graph SDK version mismatch, update both.'
-        Connect = {
-            $sc = Read-Default '  Scopes (comma-separated)' $script:GraphScopes
-            $script:GraphScopes = $sc
-            $p = @{ Scopes = @($sc -split '\s*,\s*' | Where-Object { $_ }) }
-            if ($script:Tenant) { $p.TenantId = $script:Tenant }
-            Connect-Entra @p
-        }
-        Test = { $c = Get-EntraContext; if ($c) { "$($c.Account)  [$(@($c.Scopes).Count) scopes]" } }
-        Disconnect = { Disconnect-MgGraph | Out-Null }
+        Connect = { Connect-GraphSession -Entra }
+        Test = { Get-GraphSess -Entra }
+        Disconnect = { Disconnect-Entra | Out-Null }
+    },
+    @{
+        Key = 'ENTRAB'; Name = 'Microsoft Entra (Beta)'; Group = 'mg'; Shared = $true; Conflicts = @('Microsoft.Entra')
+        Family = '^Microsoft\.Entra\.Beta(\.|$)'
+        Module = 'Microsoft.Entra.Beta'; Install = 'Microsoft.Entra.Beta'
+        MinPS = '5.1'; WinPSOnly = $false; Deps = @('Microsoft.Graph.Authentication')
+        Notes = 'Microsoft.Entra.Beta module. Do not load it in the same console as Microsoft.Entra - the cmdlet names collide. Shares the Graph session.'
+        Hint  = 'Cmdlet name clashes: open this one in a fresh console (N). Consent prompt = scope not granted yet.'
+        Connect = { Connect-GraphSession -Entra }
+        Test = { Get-GraphSess -Entra }
+        Disconnect = { Disconnect-Entra | Out-Null }
     },
     @{
         Key = 'AZ'; Name = 'Azure (Az)'
+        Family = '^Az(\.|$)'
         Module = 'Az.Accounts'; Install = 'Az'
         MinPS = '5.1'; WinPSOnly = $false; Deps = @()
         Notes = 'Connect-AzAccount. Install pulls the full Az rollup (large). Microsoft recommends PowerShell 7.2+ for Az.'
@@ -144,11 +193,18 @@ $script:Services = @(
             if ($script:Tenant) { $p.Tenant = $script:Tenant }
             Connect-AzAccount @p
         }
-        Test = { $c = Get-AzContext; if ($c) { "$($c.Account.Id) | $($c.Subscription.Name)" } }
+        Test = {
+            $c = Get-AzContext
+            if ($c) {
+                $sub = if ($c.Subscription.Name) { "sub: $($c.Subscription.Name)" } else { '' }
+                New-Sess ([string]$c.Account.Id) ([string]$c.Tenant.Id) '' $sub
+            }
+        }
         Disconnect = { Disconnect-AzAccount | Out-Null }
     },
     @{
         Key = 'TEAMS'; Name = 'Microsoft Teams'
+        Family = '^MicrosoftTeams$'
         Module = 'MicrosoftTeams'; Install = 'MicrosoftTeams'
         MinPS = '5.1'; WinPSOnly = $false; Deps = @()
         Notes = 'Connect-MicrosoftTeams. Target tenant is passed as -TenantId.'
@@ -158,13 +214,14 @@ $script:Services = @(
             if ($script:Tenant) { $p.TenantId = $script:Tenant }
             $r = Connect-MicrosoftTeams @p
             $r | Format-List Account, Tenant, TenantId | Out-Host
-            if ($r.Account) { $script:Conn['TEAMS'] = [string]$r.Account }
+            if ($r.Account) { $script:Conn['TEAMS'] = New-Sess ([string]$r.Account) ([string]$r.TenantId) '' '' }
         }
         Test = $null
         Disconnect = { Disconnect-MicrosoftTeams | Out-Null }
     },
     @{
         Key = 'SPO'; Name = 'SharePoint Online'
+        Family = '^Microsoft\.Online\.SharePoint\.PowerShell$'
         Module = 'Microsoft.Online.SharePoint.PowerShell'; Install = 'Microsoft.Online.SharePoint.PowerShell'
         MinPS = '5.1'; WinPSOnly = $true; Deps = @()
         Notes = 'Connect-SPOService. Admin URL is prefilled from the target tenant when it is a *.onmicrosoft.com domain.'
@@ -176,13 +233,14 @@ $script:Services = @(
             if (-not $url) { throw 'Admin URL is required.' }
             $script:SpoUrl = $url
             Connect-SPOService -Url $url
-            $script:Conn['SPO'] = $url
+            $script:Conn['SPO'] = New-Sess '' '' (Get-SpTenant $url) $url
         }
         Test = $null
         Disconnect = { Disconnect-SPOService }
     },
     @{
         Key = 'PNP'; Name = 'PnP PowerShell'
+        Family = '^PnP\.PowerShell$'
         Module = 'PnP.PowerShell'; Install = 'PnP.PowerShell'
         MinPS = '7.4'; WinPSOnly = $false; Deps = @()
         Notes = 'Connect-PnPOnline -Interactive. Needs your own Entra app since Sept 2024 (Register-PnPEntraIDAppForInteractiveLogin). $env:PNP_CLIENTID prefills it.'
@@ -199,10 +257,205 @@ $script:Services = @(
             if ($script:Tenant) { $p.Tenant = $script:Tenant }
             Connect-PnPOnline @p
         }
-        Test = { (Get-PnPConnection).Url }
+        Test = {
+            $c = Get-PnPConnection
+            if ($c) { New-Sess '' '' (Get-SpTenant ([string]$c.Url)) ([string]$c.Url) }
+        }
         Disconnect = { Disconnect-PnPOnline }
+    },
+    @{
+        Key = 'PPAC'; Name = 'Power Platform admin'
+        Family = '^Microsoft\.PowerApps\.Administration\.PowerShell$'
+        Module = 'Microsoft.PowerApps.Administration.PowerShell'; Install = 'Microsoft.PowerApps.Administration.PowerShell'
+        MinPS = '5.1'; WinPSOnly = $true; Deps = @()
+        Notes = 'Add-PowerAppsAccount (interactive sign-in). Windows PowerShell module. It does not report the connected tenant, so the tool cannot verify it.'
+        Hint  = 'Sign-in loops or assembly errors: close the sign-in window and retry in a fresh console (N).'
+        Connect = {
+            $p = @{}
+            $tid = ''
+            if ($script:Tenant -match $script:GuidRx) { $p.TenantID = $script:Tenant; $tid = $script:Tenant }
+            elseif ($script:Tenant) { Write-Host '  Target is a domain - Add-PowerAppsAccount takes a tenant ID, so pick the account for that tenant at sign-in.' -ForegroundColor Yellow }
+            Add-PowerAppsAccount @p
+            $script:Conn['PPAC'] = New-Sess '' $tid '' 'tenant not reported by the module'
+        }
+        Test = $null
+        Disconnect = { Remove-PowerAppsAccount }
+    },
+    @{
+        Key = 'PBI'; Name = 'Power BI'
+        Family = '^MicrosoftPowerBIMgmt(\.|$)'
+        Module = 'MicrosoftPowerBIMgmt.Profile'; Install = 'MicrosoftPowerBIMgmt'
+        MinPS = '5.1'; WinPSOnly = $false; Deps = @()
+        Notes = 'Connect-PowerBIServiceAccount. Install pulls the full MicrosoftPowerBIMgmt rollup. The module bundles an older MSAL - connect it in a fresh console if other modules are loaded.'
+        Hint  = 'Assembly/method errors = MSAL conflict, connect in a fresh console (N).'
+        Connect = {
+            $p = @{}
+            if ($script:Tenant) { $p.Tenant = $script:Tenant }
+            $r = Connect-PowerBIServiceAccount @p
+            if ($r -and $r.UserName) { $script:Conn['PBI'] = New-Sess ([string]$r.UserName) ([string]$r.TenantId) '' ([string]$r.Environment) }
+        }
+        Test = $null
+        Disconnect = { Disconnect-PowerBIServiceAccount | Out-Null }
     }
 )
+
+# ---------------------------------------------------------------- session / tenant helpers (local state only, no tenant calls)
+function New-Sess([string]$Account, [string]$TenantId, [string]$Tenant, [string]$Detail) {
+    [pscustomobject]@{ Account = $Account; TenantId = $TenantId; Tenant = $Tenant; Detail = $Detail }
+}
+
+function ConvertTo-Sess($Raw) {
+    if ($null -eq $Raw) { return $null }
+    if ($Raw -is [string]) {
+        if (-not $Raw) { return $null }
+        return (New-Sess $Raw '' '' '')
+    }
+    if ($Raw.PSObject.Properties['TenantId'] -and $Raw.PSObject.Properties['Account']) { return $Raw }
+    New-Sess ([string]$Raw) '' '' ''
+}
+
+function Get-SessLabel($Sess) {
+    if ($Sess.Tenant) { return [string]$Sess.Tenant }
+    if ($Sess.TenantId) { return [string]$Sess.TenantId }
+    'tenant not reported'
+}
+
+function Format-Sess($Sess) {
+    if (-not $Sess) { return '' }
+    (@([string]$Sess.Account, [string]$Sess.Detail) | Where-Object { $_ }) -join ' | '
+}
+
+function Get-MatchColor([string]$M) {
+    switch ($M) { 'mismatch' { 'Red' } 'unverified' { 'Yellow' } default { 'Green' } }
+}
+
+function Get-SvcGroup($s) { if ($s.Group) { $s.Group } else { $s.Key } }
+
+function Get-SpTenant([string]$Url) {
+    if ($Url -match '^https?://([^./]+?)(-admin|-my)?\.sharepoint\.com') { return "$($Matches[1]).onmicrosoft.com" }
+    ''
+}
+
+function ConvertTo-ExoSess($Ci) {
+    if ($Ci.DelegatedOrganization) { New-Sess ([string]$Ci.UserPrincipalName) '' ([string]$Ci.DelegatedOrganization) 'delegated' }
+    else { New-Sess ([string]$Ci.UserPrincipalName) ([string]$Ci.TenantID) '' '' }
+}
+
+function Get-GraphSess([switch]$Entra) {
+    $c = if ($Entra) { Get-EntraContext } else { Get-MgContext }
+    if ($c) { New-Sess ([string]$c.Account) ([string]$c.TenantId) '' ("$($c.AuthType), $(@($c.Scopes).Count) scopes") }
+}
+
+# Domain -> tenant ID through the public, anonymous OpenID configuration of the tenant. Cached. Empty when it cannot be resolved.
+function Resolve-TenantGuid([string]$Name) {
+    if (-not $Name) { return '' }
+    if ($Name -match $script:GuidRx) { return $Name.ToLower() }
+    $k = $Name.Trim().ToLower()
+    if ($script:TenantIds.ContainsKey($k)) { return $script:TenantIds[$k] }
+    $id = ''
+    try {
+        if (-not $script:Sys.IsPS7) { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 }
+        $uri = 'https://login.microsoftonline.com/' + [uri]::EscapeDataString($k) + '/v2.0/.well-known/openid-configuration'
+        $r = Invoke-RestMethod -Uri $uri -TimeoutSec 4 -ErrorAction Stop
+        if ($r.issuer -match '/([0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})/') { $id = $Matches[1].ToLower() }
+    }
+    catch { $id = '' }
+    $script:TenantIds[$k] = $id
+    $id
+}
+
+# '' (no target set) | 'ok' | 'mismatch' | 'unverified' (cannot tell)
+function Get-TenantMatch([string]$Target, $Sess) {
+    if (-not $Target -or -not $Sess) { return '' }
+    $t = $Target.Trim()
+    $cands = @(@([string]$Sess.TenantId, [string]$Sess.Tenant) | Where-Object { $_ })
+    if (-not $cands.Count) { return 'unverified' }
+    foreach ($c in $cands) { if ($c -ieq $t) { return 'ok' } }
+    $tg = Resolve-TenantGuid $t
+    if (-not $tg) { return 'unverified' }
+    $resolved = $false
+    foreach ($c in $cands) {
+        $cg = Resolve-TenantGuid $c
+        if ($cg) {
+            if ($cg -ieq $tg) { return 'ok' }
+            $resolved = $true
+        }
+    }
+    if ($resolved) { 'mismatch' } else { 'unverified' }
+}
+
+# One entry per tenant we hold sessions for (the same tenant seen as a domain by one module and as an ID by another is merged)
+function Get-SessGroups {
+    $map = [ordered]@{}
+    $rank = @{ '' = 0; 'ok' = 1; 'unverified' = 2; 'mismatch' = 3 }
+    for ($i = 0; $i -lt $script:Services.Count; $i++) {
+        $st = $script:States[$i]
+        if (-not $st.Sess) { continue }
+        $sess = $st.Sess
+        $id = ''
+        if ($sess.TenantId) { $id = Resolve-TenantGuid ([string]$sess.TenantId) }
+        elseif ($sess.Tenant) { $id = Resolve-TenantGuid ([string]$sess.Tenant) }
+        $key = if ($id) { $id } elseif ($sess.Tenant) { ([string]$sess.Tenant).ToLower() } else { 'unknown' }
+        if (-not $map.Contains($key)) {
+            $map[$key] = [pscustomobject]@{ Label = ''; Names = (New-Object System.Collections.Generic.List[string]); Match = '' }
+        }
+        $g = $map[$key]
+        $g.Names.Add($script:Services[$i].Key)
+        $lbl = Get-SessLabel $sess
+        if (-not $g.Label -or (($g.Label -match $script:GuidRx) -and ($lbl -notmatch $script:GuidRx) -and $lbl -ne 'tenant not reported')) { $g.Label = $lbl }
+        if ($rank[[string]$st.Match] -gt $rank[[string]$g.Match]) { $g.Match = [string]$st.Match }
+    }
+    @($map.Values)
+}
+
+# ---------------------------------------------------------------- Graph / Entra connect
+function Read-GraphScopes {
+    Write-Host '  Read-only scope presets:' -ForegroundColor DarkGray
+    for ($i = 0; $i -lt $script:GraphPresets.Count; $i++) {
+        Write-Host ('    [{0}] {1}' -f ($i + 1), $script:GraphPresets[$i].Name) -ForegroundColor Gray
+        Write-Host ('        ' + $script:GraphPresets[$i].Scopes) -ForegroundColor DarkGray
+    }
+    Write-Host ''
+    $v = Read-Default '  Preset number(s) like 1,3 - or scopes (comma-separated)' $script:GraphScopes
+    if ($v -match '^\d+(\s*,\s*\d+)*$') {
+        $picked = New-Object System.Collections.Generic.List[string]
+        foreach ($n in ($v -split '\s*,\s*')) {
+            $ix = [int]$n - 1
+            if ($ix -lt 0 -or $ix -ge $script:GraphPresets.Count) { throw "There is no preset number $n." }
+            foreach ($sc in ($script:GraphPresets[$ix].Scopes -split '\s*,\s*')) { if (-not $picked.Contains($sc)) { $picked.Add($sc) } }
+        }
+        $v = $picked -join ', '
+    }
+    $notRead = @($v -split '\s*,\s*' | Where-Object { $_ -and $_ -notmatch '\.Read(Basic)?(\.|$)' -and $_ -notmatch '^(openid|profile|email|offline_access)$' })
+    if ($notRead.Count) { Write-Host ('  ! Not read-only: ' + ($notRead -join ', ')) -ForegroundColor Yellow }
+    $script:GraphScopes = $v
+    $v
+}
+
+function Connect-GraphSession([switch]$Entra) {
+    $sc = Read-GraphScopes
+    $p = @{ Scopes = @($sc -split '\s*,\s*' | Where-Object { $_ }); NoWelcome = $true }
+    if ($script:Tenant) { $p.TenantId = $script:Tenant }
+    if ($Entra) { Connect-Entra @p } else { Connect-MgGraph @p }
+}
+
+# ---------------------------------------------------------------- connection log (local file, no secrets)
+function Write-ConnLog([string]$Action, [string]$Key, [string]$Result, $Sess) {
+    try {
+        $dir = Split-Path -Parent $script:LogPath
+        if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $tenant = ''; $acct = ''; $m = ''
+        if ($Sess) {
+            $tenant = Get-SessLabel $Sess
+            $acct = [string]$Sess.Account
+            $m = Get-TenantMatch $script:Tenant $Sess
+        }
+        $res = ($Result -replace '[\r\n\t]+', ' ')
+        $line = @(('{0:yyyy-MM-dd HH:mm:ss}' -f (Get-Date)), "$env:USERDOMAIN\$env:USERNAME", $env:COMPUTERNAME, $Action, $Key, $script:Tenant, $tenant, $acct, $m, $res) -join "`t"
+        Add-Content -Path $script:LogPath -Value $line -Encoding UTF8
+    }
+    catch { }
+}
 
 # ---------------------------------------------------------------- environment / module discovery
 function Get-SysState {
@@ -357,16 +610,28 @@ function Get-SvcState($s) {
     if ($s.WinPSOnly -and $sys.IsPS7) {
         $warn.Add('Windows PowerShell module: loads through the PS7 compatibility layer. Native 5.1 is more reliable.')
     }
+    foreach ($c in @($s.Conflicts)) {
+        if ($c -and (Get-Module -Name $c)) { $warn.Add("$c is loaded in this console and clashes with $($s.Module). Press N to use a fresh console.") }
+    }
     if ($mod -and $s.Install -ne $s.Module -and -not (Get-Newest $s.Install)) {
         $warn.Add("Only $($s.Module) is installed, not the full $($s.Install) rollup - cmdlets beyond connect may be missing.")
     }
 
-    $conn = $null
+    $sess = $null
     if ($state -eq 'READY' -and (Get-Module -Name $s.Module)) {
-        if ($s.Test) { try { $conn = @(& $s.Test 2>$null)[0] } catch { $conn = $null } }
-        elseif ($script:Conn.ContainsKey($s.Key)) { $conn = $script:Conn[$s.Key] }
+        $raw = $null
+        if ($s.Test) { try { $raw = @(& $s.Test 2>$null)[0] } catch { $raw = $null } }
+        elseif ($script:Conn.ContainsKey($s.Key)) { $raw = $script:Conn[$s.Key] }
+        $sess = ConvertTo-Sess $raw
     }
-    if ($conn) { $state = 'CONNECTED' }
+    $tm = ''
+    if ($sess) {
+        $state = 'CONNECTED'
+        $tm = Get-TenantMatch $script:Tenant $sess
+        if ($tm -eq 'mismatch') {
+            $warn.Add("Connected to $(Get-SessLabel $sess), NOT the target tenant $($script:Tenant). Press D to disconnect and reconnect, or T to change the target.")
+        }
+    }
 
     $target = if (Get-Newest $s.Install) { $s.Install } else { $s.Module }
     $upd = $script:Updates[$target]
@@ -384,7 +649,9 @@ function Get-SvcState($s) {
         Issues   = $issues
         Warn     = $warn
         Fix      = $fix
-        Conn     = $conn
+        Conn     = (Format-Sess $sess)
+        Sess     = $sess
+        Match    = $tm
         Update   = $upd
     }
 }
@@ -462,6 +729,29 @@ function Write-Key([string]$Key, [string]$Label) {
 
 function Write-Rule { Write-Seg ('  ' + ($script:G.SH * ($script:W - 4))) DarkGray; Write-Eol }
 
+# lays the key legend out in as many lines as the window width needs
+function Update-KeyLines {
+    $keys = @(
+        @($script:G.UpDn, 'select'), @('Enter', 'connect'), @('D', 'disconnect'), @('A', 'connect all'), @('N', 'new console'),
+        @('I', 'install'), @('U', 'update'), @('C', 'check updates'), @('V', 'clean old versions'),
+        @('S', 'type commands'), @('T', 'tenant'), @('P', 'PowerShell 7'), @('X', 'disconnect all'), @('R', 'rescan'), @('Q', 'quit to prompt')
+    )
+    $lines = New-Object System.Collections.Generic.List[object]
+    $cur = New-Object System.Collections.Generic.List[object]
+    $len = 0
+    foreach ($k in $keys) {
+        $n = $k[0].Length + 3 + $k[1].Length + 2
+        if ($cur.Count -and ($len + $n) -gt $script:W) {
+            $lines.Add($cur.ToArray())
+            $cur = New-Object System.Collections.Generic.List[object]
+            $len = 0
+        }
+        $cur.Add($k); $len += $n
+    }
+    if ($cur.Count) { $lines.Add($cur.ToArray()) }
+    $script:KeyLines = $lines.ToArray()
+}
+
 function Reset-Screen {
     Clear-Host
     $script:Top = [Console]::WindowTop
@@ -474,20 +764,22 @@ function Reset-Screen {
 function Update-States {
     $script:States = @(foreach ($s in $script:Services) { Get-SvcState $s })
     $script:Warns  = @(Get-EnvWarnings)
+    $script:Groups = @(Get-SessGroups)
 }
 
 function Write-Row([int]$i) {
     $s = $script:Services[$i]; $st = $script:States[$i]
     $isSel = $i -eq $script:Sel
     $bg = if ($isSel) { 'DarkBlue' } else { '' }
-    $ptr = if ($isSel) { " $($G.Ptr)$($i + 1) " } else { "  $($i + 1) " }
+    $num = ($i + 1).ToString().PadLeft(2)
+    $ptr = if ($isSel) { " $($G.Ptr)$num " } else { "  $num " }
     Write-Seg $ptr Cyan $bg
     Write-Seg (Fit $s.Name 26) $(if ($isSel) { 'White' } else { 'Gray' }) $bg
     Write-Seg (Fit $s.Module 40) DarkGray $bg
     Write-Seg (Fit $(if ($st.Version) { $st.Version } else { '-' }) 11) Gray $bg
     Write-Seg "$($G.Dot) $($st.State)" (Get-StateColor $st.State) $bg
     if ($st.Update) { Write-Seg "  $($G.Arr) $($st.Update)" Yellow $bg }
-    if ($st.Conn)   { Write-Seg "  $($st.Conn)" DarkGray $bg }
+    if ($st.Sess)   { Write-Seg "  $(Get-SessLabel $st.Sess)" (Get-MatchColor $st.Match) $bg }
     Write-Eol $bg
 }
 
@@ -495,12 +787,18 @@ function Write-Details {
     $script:Lines = $script:DetTop; $script:LL = 0
     $s = $script:Services[$script:Sel]; $st = $script:States[$script:Sel]
     Write-Seg "  $($s.Name)" White; Write-Seg "   $($s.Module)" DarkGray
-    if ($st.Versions -gt 1) { Write-Seg "   ($($st.Versions) versions side by side)" DarkYellow }
+    if ($st.Versions -gt 1) { Write-Seg "   ($($st.Versions) versions side by side - V cleans up)" DarkYellow }
     Write-Eol
     $fixed = 2
     Write-Seg '  Requires  ' DarkGray; Write-Seg (Get-ReqText $s) Gray; Write-Eol
     if ($st.Path) { Write-Seg '  Path      ' DarkGray; Write-Seg $st.Path Gray; Write-Eol; $fixed++ }
-    if ($st.Conn) { Write-Seg '  Session   ' DarkGray; Write-Seg ([string]$st.Conn) Green; Write-Eol; $fixed++ }
+    if ($st.Sess) {
+        Write-Seg '  CONNECTED TO ' DarkGray; Write-Seg (Get-SessLabel $st.Sess) (Get-MatchColor $st.Match)
+        if ($st.Conn) { Write-Seg "   $($st.Conn)" DarkGray }
+        if ($st.Match -eq 'mismatch') { Write-Seg '   NOT the target tenant' Red }
+        elseif ($st.Match -eq 'unverified') { Write-Seg '   cannot verify against the target' Yellow }
+        Write-Eol; $fixed++
+    }
 
     # free-text lines, trimmed so the whole frame always fits the window (scrolling breaks absolute positioning)
     $info = New-Object System.Collections.Generic.List[object]
@@ -509,8 +807,8 @@ function Write-Details {
     foreach ($x in $st.Fix)    { foreach ($l in @(Get-WrapLines "$($G.Arr) $x" '  ')) { $info.Add(@($l, 'Cyan')) } }
     foreach ($l in @(Get-WrapLines $s.Notes '  ')) { $info.Add(@($l, 'DarkGray')) }
 
-    # frame = DetTop + fixed + info + rule(1) + keys(2) + msg(1); keep one spare row at the bottom
-    $budget = [Math]::Max(0, [Console]::WindowHeight - 1 - $script:DetTop - $fixed - 4)
+    # frame = DetTop + fixed + info + rule(1) + keys + msg(1); keep one spare row at the bottom
+    $budget = [Math]::Max(0, [Console]::WindowHeight - 1 - $script:DetTop - $fixed - (2 + $script:KeyLines.Count))
     if ($info.Count -gt $budget) {
         $keep = [Math]::Max(0, $budget - 1)
         $shown = @($info | Select-Object -First $keep)
@@ -520,8 +818,10 @@ function Write-Details {
     foreach ($it in $shown) { Write-Seg $it[0] $it[1]; Write-Eol }
     Write-Rule
 
-    Write-Key $G.UpDn 'select'; Write-Key 'Enter' 'connect'; Write-Key 'I' 'install'; Write-Key 'U' 'update'; Write-Key 'C' 'check updates'; Write-Eol
-    Write-Key 'S' 'type commands'; Write-Key 'T' 'tenant'; Write-Key 'P' 'PowerShell 7'; Write-Key 'X' 'disconnect all'; Write-Key 'R' 'rescan'; Write-Key 'Q' 'quit to prompt'; Write-Eol
+    foreach ($kl in $script:KeyLines) {
+        foreach ($k in $kl) { Write-Key $k[0] $k[1] }
+        Write-Eol
+    }
     if ($script:Msg) { Write-Seg "  $($script:Msg)" $script:MsgColor }
     Write-Eol
 
@@ -538,6 +838,7 @@ function Show-Menu {
     $script:W = [Math]::Max(40, [Math]::Min([Console]::WindowWidth - 1, 130))
     $W = $script:W
     $sys = $script:Sys
+    Update-KeyLines
 
     [Console]::SetCursorPosition(0, $script:Top)
     $script:Lines = 0; $script:LL = 0
@@ -564,14 +865,32 @@ function Show-Menu {
     Write-Seg $(if ($script:Tenant) { $script:Tenant } else { 'home tenant' }) $(if ($script:Tenant) { 'Yellow' } else { 'Gray' })
     Write-Seg '   MSAL loaded ' DarkGray; Write-Seg $(if ($msal) { [string]$msal } else { 'none' }) Gray
     Write-Eol
+    if ($script:Groups.Count) {
+        foreach ($g in $script:Groups) {
+            Write-Seg '  CONNECTED TO ' DarkGray; Write-Seg $g.Label (Get-MatchColor $g.Match); Write-Seg "   $($g.Names -join ', ')" DarkGray
+            if ($g.Match -eq 'mismatch') { Write-Seg '   NOT the target tenant' Red }
+            elseif ($g.Match -eq 'unverified') { Write-Seg '   cannot verify against the target' Yellow }
+            Write-Eol
+        }
+    }
+    else { Write-Seg '  CONNECTED TO ' DarkGray; Write-Seg 'nothing' DarkGray; Write-Eol }
     foreach ($x in $script:Warns) { Write-Wrapped "! $x" '  ' Yellow }
 
-    # service table
+    # service table - shows a window of rows when the console is too short for all of them
     Write-Eol
-    Write-Seg ('    ' + (Fit 'SERVICE' 26) + (Fit 'MODULE' 40) + (Fit 'VERSION' 11) + 'STATUS') DarkGray; Write-Eol
+    $count = $script:Services.Count
+    $rowsStart = $script:Lines + 2
+    $avail = [Console]::WindowHeight - 1 - $rowsStart - (9 + $script:KeyLines.Count)
+    $script:Visible = [Math]::Max(3, [Math]::Min($count, $avail))
+    if ($script:Sel -lt $script:VTop) { $script:VTop = $script:Sel }
+    elseif ($script:Sel -ge ($script:VTop + $script:Visible)) { $script:VTop = $script:Sel - $script:Visible + 1 }
+    $script:VTop = [Math]::Max(0, [Math]::Min($script:VTop, $count - $script:Visible))
+    Write-Seg ('     ' + (Fit 'SERVICE' 26) + (Fit 'MODULE' 40) + (Fit 'VERSION' 11) + 'STATUS') DarkGray
+    if ($script:Visible -lt $count) { Write-Seg "   rows $($script:VTop + 1)-$($script:VTop + $script:Visible) of $count ($($G.UpDn) scrolls)" Yellow }
+    Write-Eol
     Write-Rule
     $script:RowTop = $script:Lines
-    for ($i = 0; $i -lt $script:Services.Count; $i++) { Write-Row $i }
+    for ($i = $script:VTop; $i -lt ($script:VTop + $script:Visible); $i++) { Write-Row $i }
     Write-Rule
     $script:DetTop = $script:Lines
     Write-Details
@@ -580,9 +899,10 @@ function Show-Menu {
 # arrow-key navigation: repaint only the two changed rows + the details panel
 function Show-Nav([int]$Old) {
     if ([Console]::WindowWidth -ne $script:LastW -or [Console]::WindowHeight -ne $script:LastH) { Show-Menu; return }
+    if ($script:Sel -lt $script:VTop -or $script:Sel -ge ($script:VTop + $script:Visible)) { Show-Menu; return }
     if ($Old -ne $script:Sel) {
         foreach ($i in @($Old, $script:Sel)) {
-            [Console]::SetCursorPosition(0, $script:Top + $script:RowTop + $i)
+            [Console]::SetCursorPosition(0, $script:Top + $script:RowTop + ($i - $script:VTop))
             $script:LL = 0
             Write-Row $i
         }
@@ -603,9 +923,11 @@ function Invoke-Screen {
     Write-Host ''
     $ErrorActionPreference = 'Stop'
     $success = $true
+    $script:LastError = ''
     try { & $Body | Out-Host }
     catch {
         $success = $false
+        $script:LastError = $_.Exception.Message
         Write-Host ''
         Write-Host "  FAILED: $($_.Exception.Message)" -ForegroundColor Red
         if ($Hint) { Write-Host "  Hint: $Hint" -ForegroundColor Yellow }
@@ -654,32 +976,134 @@ function Invoke-WinPS([string]$Command) {
 }
 
 # ---------------------------------------------------------------- actions
+# The sign-in steps for one service. Used by Connect-Svc (one) and Connect-All (several).
+function Start-SvcConnect($s, $st) {
+    if ($st.State -eq 'CONNECTED') { Write-Host "  Already connected ($($st.Conn)) - reconnecting." -ForegroundColor DarkGray }
+    if ($script:Tenant) { Write-Host "  Target tenant : $($script:Tenant)" -ForegroundColor DarkGray }
+    $msal = Get-MsalVersion
+    if ($msal -and -not (Get-Module -Name $s.Module)) {
+        Write-Host "  ! MSAL $msal is already loaded by another module. If this fails with an assembly/method error, use a fresh console (N)." -ForegroundColor Yellow
+    }
+    Write-Host "  Importing $($s.Module)..." -ForegroundColor DarkGray
+    # -Global: cmdlets must outlive this script's scope so they work at the prompt after quitting
+    if ($s.WinPSOnly -and $script:Sys.IsPS7) { Import-Module -Name $s.Module -UseWindowsPowerShell -Global -WarningAction SilentlyContinue }
+    else { Import-Module -Name $s.Module -Global }
+    Write-Host '  Signing in - a browser or account picker may open...' -ForegroundColor DarkGray
+    Write-Host ''
+    $script:Conn.Remove($s.Key)
+    & $s.Connect
+    if (-not $script:Conn.ContainsKey($s.Key)) { $script:Conn[$s.Key] = 'connected (this console)' }
+    Write-Host ''
+    Write-Host "  Connected to $($s.Name)." -ForegroundColor Green
+}
+
 function Connect-Svc($s) {
     $st = Get-SvcState $s
     if ($st.State -ne 'READY' -and $st.State -ne 'CONNECTED') {
         Set-Msg "$($s.Name): $($st.Issues[0])" Red
         return
     }
-    $ok = Invoke-Screen "Connect $($G.Arr) $($s.Name)" -Hint $s.Hint -Body {
-        if ($st.State -eq 'CONNECTED') { Write-Host "  Already connected ($($st.Conn)) - reconnecting." -ForegroundColor DarkGray }
-        if ($script:Tenant) { Write-Host "  Target tenant : $($script:Tenant)" -ForegroundColor DarkGray }
-        $msal = Get-MsalVersion
-        if ($msal -and -not (Get-Module -Name $s.Module)) {
-            Write-Host "  ! MSAL $msal is already loaded by another module. If this fails with an assembly/method error, use a fresh console." -ForegroundColor Yellow
-        }
-        Write-Host "  Importing $($s.Module)..." -ForegroundColor DarkGray
-        # -Global: cmdlets must outlive this script's scope so they work at the prompt after quitting
-        if ($s.WinPSOnly -and $script:Sys.IsPS7) { Import-Module -Name $s.Module -UseWindowsPowerShell -Global -WarningAction SilentlyContinue }
-        else { Import-Module -Name $s.Module -Global }
-        Write-Host '  Signing in - a browser or account picker may open...' -ForegroundColor DarkGray
-        Write-Host ''
-        $script:Conn.Remove($s.Key)
-        & $s.Connect
-        if (-not $script:Conn.ContainsKey($s.Key)) { $script:Conn[$s.Key] = 'connected (this console)' }
-        Write-Host ''
-        Write-Host "  Connected to $($s.Name)." -ForegroundColor Green
+    $ok = Invoke-Screen "Connect $($G.Arr) $($s.Name)" -Hint $s.Hint -Body { Start-SvcConnect $s $st }
+    $after = Get-SvcState $s
+    if ($ok) {
+        Write-ConnLog 'CONNECT' $s.Key 'ok' $after.Sess
+        if ($after.Match -eq 'mismatch') { Set-Msg "Connected to $($s.Name), but to $(Get-SessLabel $after.Sess) - NOT the target tenant $($script:Tenant)." Red }
+        else { Set-Msg "Connected to $($s.Name)." Green }
     }
-    if ($ok) { Set-Msg "Connected to $($s.Name)." Green } else { Set-Msg "Connect to $($s.Name) failed." Red }
+    else {
+        Write-ConnLog 'CONNECT-FAILED' $s.Key $script:LastError $null
+        Set-Msg "Connect to $($s.Name) failed." Red
+    }
+}
+
+function Disconnect-Svc($s) {
+    $st = Get-SvcState $s
+    if ($st.State -ne 'CONNECTED') { Set-Msg "$($s.Name) is not connected." Yellow; return }
+    $grp = Get-SvcGroup $s
+    $peers = @($script:Services | Where-Object { $_.Key -ne $s.Key -and (Get-SvcGroup $_) -eq $grp } | ForEach-Object { $_.Name })
+    $sess = $st.Sess
+    $ok = Invoke-Screen "Disconnect $($G.Arr) $($s.Name)" -NoPause -Body {
+        if ($peers.Count) { Write-Host "  Shares one session with: $($peers -join ', ') - they disconnect too." -ForegroundColor DarkGray }
+        & $s.Disconnect
+        Write-Host '  Disconnected.' -ForegroundColor Green
+    }
+    foreach ($x in $script:Services) { if ((Get-SvcGroup $x) -eq $grp) { $script:Conn.Remove($x.Key) } }
+    if ($ok) {
+        Write-ConnLog 'DISCONNECT' $s.Key 'ok' $sess
+        $note = if ($peers.Count) { " (and $($peers -join ', '))" } else { '' }
+        Set-Msg "Disconnected $($s.Name)$note." Green
+    }
+    else {
+        Write-ConnLog 'DISCONNECT-FAILED' $s.Key $script:LastError $sess
+        Set-Msg "Disconnect of $($s.Name) failed." Red
+    }
+}
+
+function Connect-All {
+    $plan = New-Object System.Collections.Generic.List[object]
+    $skipped = New-Object System.Collections.Generic.List[string]
+    $sharedSeen = @{}
+    foreach ($s in $script:Services) {
+        $st = Get-SvcState $s
+        if ($s.Shared -and $st.State -eq 'CONNECTED') { $sharedSeen[(Get-SvcGroup $s)] = $true }
+        if ($st.State -ne 'READY') { continue }
+        if ($s.Shared) {
+            $g = Get-SvcGroup $s
+            if ($sharedSeen.ContainsKey($g)) { $skipped.Add($s.Name); continue }
+            $sharedSeen[$g] = $true
+        }
+        $plan.Add($s)
+    }
+    if (-not $plan.Count) { Set-Msg 'Nothing to connect: services are already connected, not installed, or need another PowerShell.' Yellow; return }
+    $script:BatchOk = 0; $script:BatchFail = 0
+    $null = Invoke-Screen 'Connect all ready services' -Body {
+        Write-Host '  Will connect, in order:' -ForegroundColor DarkGray
+        foreach ($p in $plan) { Write-Host "    $($p.Name)" }
+        if ($skipped.Count) { Write-Host "  Skipped (share the Graph session): $($skipped -join ', ')" -ForegroundColor DarkGray }
+        if ($script:Tenant) { Write-Host "  Target tenant : $($script:Tenant)" -ForegroundColor DarkGray }
+        Write-Host '  If one fails with an assembly/MSAL error, connect that one from a fresh console (N).' -ForegroundColor DarkGray
+        Write-Host ''
+        $a = Read-Host '  Continue? (Y/n)'
+        if ($a -match '^[nN]') { Write-Host '  Cancelled.' -ForegroundColor DarkGray; return }
+        foreach ($p in $plan) {
+            Write-Host ''
+            Write-Host "  == $($p.Name) ==" -ForegroundColor Cyan
+            try {
+                Start-SvcConnect $p (Get-SvcState $p)
+                $script:BatchOk++
+                $after = Get-SvcState $p
+                Write-ConnLog 'CONNECT' $p.Key 'ok' $after.Sess
+                if ($after.Match -eq 'mismatch') { Write-Host "  ! Connected to $(Get-SessLabel $after.Sess), NOT the target tenant." -ForegroundColor Red }
+            }
+            catch {
+                $script:BatchFail++
+                Write-Host "  FAILED: $($_.Exception.Message)" -ForegroundColor Red
+                if ($p.Hint) { Write-Host "  Hint: $($p.Hint)" -ForegroundColor Yellow }
+                Write-ConnLog 'CONNECT-FAILED' $p.Key $_.Exception.Message $null
+            }
+        }
+        Write-Host ''
+        Write-Host ('  Done: {0} connected, {1} failed.' -f $script:BatchOk, $script:BatchFail) -ForegroundColor Cyan
+    }
+    if ($script:BatchFail) { Set-Msg "Connect all: $($script:BatchOk) connected, $($script:BatchFail) failed." Yellow }
+    elseif ($script:BatchOk) { Set-Msg "Connect all: $($script:BatchOk) connected." Green }
+}
+
+function Start-Fresh($s) {
+    $st = Get-SvcState $s
+    if ($st.State -ne 'READY' -and $st.State -ne 'CONNECTED') { Set-Msg "$($s.Name): $($st.Issues[0])" Red; return }
+    if (-not $script:SelfPath) { Set-Msg 'Cannot find this script on disk to relaunch it.' Red; return }
+    $needs7 = [version]$s.MinPS -ge [version]'7.0'
+    $exe = $null
+    if ($s.WinPSOnly) { $exe = 'powershell.exe' }
+    elseif ($script:Sys.IsPS7) { $exe = (Get-Process -Id $PID).Path }
+    elseif ($needs7) { $exe = $script:Sys.PwshPath }
+    else { $exe = 'powershell.exe' }
+    if (-not $exe) { Set-Msg "$($s.Name) needs PowerShell 7 - press P." Magenta; return }
+    $argList = @('-NoExit', '-ExecutionPolicy', 'Bypass', '-File', "`"$($script:SelfPath)`"", '-StartService', $s.Key)
+    if ($script:Tenant) { $argList += @('-StartTenant', "`"$($script:Tenant)`"") }
+    Start-Process -FilePath $exe -ArgumentList $argList
+    Set-Msg "Opened $($s.Name) in a fresh console - it signs in on its own there." Green
 }
 
 function Install-Svc($s) {
@@ -731,11 +1155,70 @@ function Update-Svc($s) {
             }
         }
         Write-Host ''
-        Write-Host '  Updated. Older versions stay side by side.' -ForegroundColor Green
+        Write-Host '  Updated. Older versions stay side by side (V removes them).' -ForegroundColor Green
         if ($loaded) { Write-Host '  The old version is loaded in this console - open a new one to use the update.' -ForegroundColor Yellow }
     }
     Update-ModuleCache
     if ($ok) { $script:Updates.Remove($target); Set-Msg "$target updated." Green } else { Set-Msg "Update of $target failed." Red }
+}
+
+# removes every installed version of the selected service's modules except the newest (local machine only)
+function Clear-OldVersions($s) {
+    $target = if (Get-Newest $s.Install) { $s.Install } else { $s.Module }
+    if (-not (Get-Newest $target)) { Set-Msg "$($s.Name) is not installed - press I." Yellow; return }
+    $viaWinPS = $s.WinPSOnly -and $script:Sys.IsPS7
+    $loaded = [bool](Get-Module -Name $s.Module)
+    $script:CleanResult = ''
+    $ok = Invoke-Screen "Clean old versions $($G.Arr) $target" -Body {
+        if ($loaded) { Write-Host '  This module is loaded in this console - locked files can block removal. If it fails, use a fresh console (N).' -ForegroundColor Yellow }
+        if ($viaWinPS) {
+            Write-Host '  (through Windows PowerShell)' -ForegroundColor DarkGray
+            Invoke-WinPS ('Get-Module -ListAvailable -Name ''' + $s.Module + ''' | Sort-Object Version -Descending | Select-Object -Skip 1 | ForEach-Object { Write-Host (''  removing {0} {1}'' -f $_.Name, $_.Version); Uninstall-Module -Name $_.Name -RequiredVersion $_.Version -Force }')
+            Write-Host ''
+            Write-Host '  Done.' -ForegroundColor Green
+            $script:CleanResult = "Old versions of $target removed."
+            return
+        }
+        Write-Host '  Scanning installed versions...' -ForegroundColor DarkGray
+        $all = @(Get-Module -ListAvailable -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match $s.Family -and (-not $s.FamilyExclude -or $_.Name -notmatch $s.FamilyExclude) })
+        $seen = @{}
+        $old = New-Object System.Collections.Generic.List[object]
+        foreach ($grp in ($all | Group-Object Name)) {
+            $newest = ($grp.Group | Sort-Object Version -Descending | Select-Object -First 1).Version
+            foreach ($m in $grp.Group) {
+                if ($m.Version -lt $newest) {
+                    $k = "$($m.Name)|$($m.Version)"
+                    if (-not $seen.ContainsKey($k)) { $seen[$k] = $true; $old.Add([pscustomobject]@{ Name = $m.Name; Version = $m.Version }) }
+                }
+            }
+        }
+        if (-not $old.Count) {
+            Write-Host '  Nothing to clean - only the newest version of each module is installed.' -ForegroundColor Green
+            $script:CleanResult = "$target has no old versions."
+            return
+        }
+        $modCount = @($old | Group-Object Name).Count
+        Write-Host ('  {0} old version(s) across {1} module(s) will be removed. The newest version of each is kept.' -f $old.Count, $modCount)
+        Write-Host '  Only modules that were installed from the PowerShell Gallery can be removed this way.' -ForegroundColor DarkGray
+        $a = Read-Host '  Remove them? (y/N)'
+        if ($a -notmatch '^[yY]') { Write-Host '  Cancelled.' -ForegroundColor DarkGray; $script:CleanResult = 'Cleanup cancelled.'; return }
+        # the rollup first, the Authentication / Accounts base module last, so nothing is removed while another old version still requires it
+        $order = @($old | Sort-Object @{ Expression = { if ($_.Name -eq $s.Install) { 0 } elseif ($_.Name -match '\.(Authentication|Accounts)$') { 2 } else { 1 } } }, Name, @{ Expression = 'Version'; Descending = $true })
+        $done = 0; $failed = 0
+        foreach ($m in $order) {
+            try { Uninstall-Module -Name $m.Name -RequiredVersion $m.Version -Force -ErrorAction Stop; $done++ }
+            catch {
+                $failed++
+                Write-Host ('  could not remove {0} {1}: {2}' -f $m.Name, $m.Version, $_.Exception.Message) -ForegroundColor DarkYellow
+            }
+        }
+        Write-Host ''
+        Write-Host ('  Removed {0}, could not remove {1}.' -f $done, $failed) -ForegroundColor $(if ($failed) { 'Yellow' } else { 'Green' })
+        $script:CleanResult = "Removed $done old version(s) of $target$(if ($failed) { ", $failed failed" })."
+    }
+    Update-ModuleCache
+    if ($ok) { Set-Msg $script:CleanResult Green } else { Set-Msg "Cleanup of $target failed." Red }
 }
 
 function Find-SvcUpdates {
@@ -769,7 +1252,7 @@ function Find-SvcUpdates {
 
 function Set-TargetTenant {
     $null = Invoke-Screen 'Target tenant' -NoPause -Body {
-        Write-Host '  Passed as -DelegatedOrganization (EXO / IPPS) and -TenantId / -Tenant (Graph, Entra, Az, Teams, PnP).' -ForegroundColor DarkGray
+        Write-Host '  Passed as -DelegatedOrganization (EXO / IPPS) and -TenantId / -Tenant (Graph, Entra, Az, Teams, PnP, Power BI).' -ForegroundColor DarkGray
         Write-Host '  Domain (contoso.onmicrosoft.com) or tenant ID. Blank keeps current, "-" resets to your home tenant.' -ForegroundColor DarkGray
         Write-Host ''
         $cur = if ($script:Tenant) { $script:Tenant } else { 'home tenant' }
@@ -778,7 +1261,7 @@ function Set-TargetTenant {
         elseif ($v) { $script:Tenant = $v.Trim() }
     }
     $t = if ($script:Tenant) { $script:Tenant } else { 'home tenant' }
-    Set-Msg "Target tenant: $t. Existing sessions keep their tenant - X to disconnect first." Yellow
+    Set-Msg "Target tenant: $t. Existing sessions keep their tenant - D / X to disconnect first." Yellow
 }
 
 function Start-Pwsh {
@@ -823,11 +1306,16 @@ function Disconnect-All {
         $done = @{}
         foreach ($s in $script:Services) {
             if (-not $s.Disconnect -or -not (Get-Module -Name $s.Module)) { continue }
-            $id = $s.Disconnect.ToString()
+            $id = Get-SvcGroup $s
             if ($done.ContainsKey($id)) { continue }
             $done[$id] = $true
+            $sess = (Get-SvcState $s).Sess
             Write-Host ('  {0,-26}' -f $s.Name) -NoNewline
-            try { & $s.Disconnect 2>$null | Out-Null; Write-Host 'disconnected' -ForegroundColor Green }
+            try {
+                & $s.Disconnect 2>$null | Out-Null
+                Write-Host 'disconnected' -ForegroundColor Green
+                if ($sess) { Write-ConnLog 'DISCONNECT' $s.Key 'ok (disconnect all)' $sess }
+            }
             catch { Write-Host 'nothing to disconnect' -ForegroundColor DarkGray }
         }
         if (-not $done.Count) { Write-Host '  No service modules are loaded in this console.' -ForegroundColor DarkGray }
@@ -848,6 +1336,12 @@ $redraw = $true
 try {
     [Console]::CursorVisible = $false
     Reset-Screen
+    # fresh console opened with N: sign in to that one service straight away
+    if ($StartService) {
+        for ($i = 0; $i -lt $count; $i++) {
+            if ($script:Services[$i].Key -eq $StartService) { $script:Sel = $i; Connect-Svc $script:Services[$i]; break }
+        }
+    }
     while ($run) {
         if ($dirty)  { Update-States; $dirty = $false }
         if ($redraw) { Show-Menu; $redraw = $false }
@@ -865,8 +1359,12 @@ try {
                 'Home'      { $script:Sel = 0; $nav = $true }
                 'End'       { $script:Sel = $count - 1; $nav = $true }
                 'Enter'     { Connect-Svc $svc; $dirty = $true; $redraw = $true }
+                'D'         { Disconnect-Svc $svc; $dirty = $true; $redraw = $true }
+                'A'         { Connect-All; $dirty = $true; $redraw = $true }
+                'N'         { Start-Fresh $svc; $dirty = $true; $redraw = $true }
                 'I'         { Install-Svc $svc; $dirty = $true; $redraw = $true }
                 'U'         { Update-Svc $svc; $dirty = $true; $redraw = $true }
+                'V'         { Clear-OldVersions $svc; $dirty = $true; $redraw = $true }
                 'C'         { Find-SvcUpdates; $dirty = $true; $redraw = $true }
                 'S'         { Enter-Shell; $dirty = $true; $redraw = $true }
                 'T'         { Set-TargetTenant; $dirty = $true; $redraw = $true }
@@ -888,7 +1386,10 @@ finally {
 Clear-Host
 $live = @(foreach ($s in $script:Services) {
     $st = Get-SvcState $s
-    if ($st.State -eq 'CONNECTED') { "  $($script:G.Dot) $($s.Name)  $($st.Conn)" }
+    if ($st.State -eq 'CONNECTED') {
+        $flag = if ($st.Match -eq 'mismatch') { '  (NOT the target tenant)' } else { '' }
+        "  $($script:G.Dot) $($s.Name)  CONNECTED TO $(Get-SessLabel $st.Sess)  $($st.Conn)$flag"
+    }
 })
 if ($live.Count) {
     Write-Host 'Live sessions in this console:' -ForegroundColor Cyan
